@@ -7,8 +7,10 @@ from typing import Optional
 import draccus
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torch.distributed as dist
+import numpy as np
 import tqdm
 from ema_pytorch import EMA
 from accelerate import PartialState
@@ -38,24 +40,26 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from prismatic.models.policy.transformer_utils import MAPBlock
 
 class ActionDecoder(torch.nn.Module):
-    def __init__(self, window_size = 12, hidden_dim = 512):
+    def __init__(self, window_size=12, hidden_dim=512, n_bins=256, n_dims=7):
         super().__init__()
-        self.latent_action_pool = MAPBlock(n_latents = 1, vis_dim = 4096, embed_dim = hidden_dim, n_heads = hidden_dim // 64)
-        self.visual_pool = MAPBlock(n_latents = 1, vis_dim = 4096, embed_dim = hidden_dim, n_heads = hidden_dim // 64)
+        self.n_bins = n_bins
+        self.n_dims = n_dims
+        self.window_size = window_size
 
-        self.proj = nn.Sequential(
-                                nn.Linear(hidden_dim, 7 * window_size),
-                                nn.Tanh(),
-                    )
+        self.latent_action_pool = MAPBlock(n_latents=1, vis_dim=4096, embed_dim=hidden_dim, n_heads=hidden_dim // 64)
+        self.visual_pool = MAPBlock(n_latents=1, vis_dim=4096, embed_dim=hidden_dim, n_heads=hidden_dim // 64)
+
+        self.proj = nn.Linear(hidden_dim, n_bins * n_dims * window_size)
 
     def forward(self, latent_action_tokens, visual_embed):
         visual_embed = self.visual_pool(visual_embed)
         latent_action_tokens = latent_action_tokens[:, -4:]
-        action_token = self.latent_action_pool(latent_action_tokens, init_embed = visual_embed)
+        action_token = self.latent_action_pool(latent_action_tokens, init_embed=visual_embed)
 
-        action = self.proj(action_token)
+        logits = self.proj(action_token)
+        logits = logits.view(-1, self.window_size, self.n_dims, self.n_bins)  # [B, T, 7, 256]
 
-        return action
+        return logits
 
 class Wrapped_Model(torch.nn.Module):
     def __init__(self, vla, freeze_vla = False, window_size = 12):
@@ -81,6 +85,7 @@ class Wrapped_Model(torch.nn.Module):
         return vla_output, loss, loss_one_step, latent_action_tokens
 
     def action_decoder_forward(self, batch, vla_output):
+        # TODO: Use action tokens for CE loss
         visual_embed = vla_output.hidden_states[-1][:, : self.vla.vision_backbone.featurizer.patch_embed.num_patches ].to(torch.float)
         latent_tokens = vla_output.hidden_states[-1][:, self.vla.vision_backbone.featurizer.patch_embed.num_patches : ]
         action_gt = batch["labels"].to(latent_tokens.device)
@@ -92,9 +97,21 @@ class Wrapped_Model(torch.nn.Module):
             latent_action_tokens.append(per_sample_latent_action_tokens)
         latent_action_tokens = torch.stack(latent_action_tokens).to(torch.float)
 
-        pred_action = self.action_decoder(latent_action_tokens, visual_embed).reshape(-1, self.window_size, 7)
-        loss = torch.nn.functional.l1_loss(pred_action, batch['actions'], reduction='none')
-        loss_one_step = loss[:,0].mean()
+        logits = self.action_decoder(latent_action_tokens, visual_embed)  # [B, T, 7, 256]
+
+        # Convert continuous actions to discrete token labels
+        action_gt = batch['actions']  # [B, T, 7]
+        bins = np.linspace(-1, 1, self.action_decoder.n_bins)
+        bin_centers = torch.tensor((bins[:-1] + bins[1:]) / 2.0, device=action_gt.device, dtype=action_gt.dtype)
+        
+        action_expanded = action_gt.unsqueeze(-1)  # [B, T, 7, 1]
+        bin_centers_expanded = bin_centers.unsqueeze(0).unsqueeze(0).unsqueeze(0)  # [1, 1, 1, n_bins-1]
+        distances = torch.abs(action_expanded - bin_centers_expanded)  # [B, T, 7, n_bins-1]
+        action_labels = torch.argmin(distances, dim=-1)  # [B, T, 7]
+
+        loss = F.cross_entropy(logits.reshape(-1, self.action_decoder.n_bins), action_labels.reshape(-1), reduction='none')
+        loss = loss.view(action_gt.shape[0], action_gt.shape[1], action_gt.shape[2])
+        loss_one_step = loss[:, 0].mean()
         loss = loss.mean()
 
         return loss, loss_one_step, latent_action_tokens
@@ -104,23 +121,23 @@ class Wrapped_Model(torch.nn.Module):
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "/path/to/your/pretrained-univla-7b"            # Path to your local UniVLA path
-    lam_path: str = "latent_action_model/logs/task_centric_lam_stage2/epoch=0-step=200000.ckpt"
+    vla_path: str = "/tos-bjml-prime/junhao/models/univla-7b"            # Path to your local UniVLA path
+    lam_path: str = "/tos-bjml-prime/junhao/models/univla-latent-action-model/lam-stage-2.ckpt"
     # Directory Paths
-    data_root_dir: Path = Path("/LIBERO/modified_libero_rlds")      # Path to Open-X dataset directory
+    data_root_dir: Path = Path("/tos-bjml-prime/junhao/datasets/openvla")      # Path to Open-X dataset directory
     dataset_name: str = "libero_spatial_no_noops"                   # Name of fine-tuning dataset (e.g., `droid_wipe`)
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+    run_root_dir: Path = Path("/tos-bjml-prime/junhao/models/univla-7b-custom-sft")                               # Path to directory to store logs & checkpoints
+    adapter_tmp_dir: Path = Path("/tos-bjml-prime/junhao/models/tmp")                     # Temporary directory for LoRA weights before fusing
 
     # Fine-tuning Parameters
     batch_size: int = 8                                             # Fine-tuning batch size
     max_steps: int = 30000                                          # Max number of fine-tuning steps
-    save_steps: int = 30000                                         # Interval for checkpoint saving
+    save_steps: int = 5000                                         # Interval for checkpoint saving
     learning_rate: float = 3.5e-4                                   # Fine-tuning learning rate
     grad_accumulation_steps: int = 2                                # Gradient accumulation steps
     image_aug: bool = True                                          # Whether to train with image augmentations
     shuffle_buffer_size: int = 16000                                # Dataloader shuffle buffer size (can reduce if OOM)
-    save_latest_checkpoint_only: bool = True                        # Whether to save only one checkpoint per run and
+    save_latest_checkpoint_only: bool = False                        # Whether to save only one checkpoint per run and
                                                                     #   continually。overwrite the latest checkpoint
                                                                     #   (If False, saves all checkpoints)
     # LAM setting
@@ -142,9 +159,9 @@ class FinetuneConfig:
                                                                     #   => CAUTION: Reduces memory but hurts performance
 
     # Tracking Parameters
-    wandb_project: str = "fientune-LIBERO"                          # Name of W&B project to log to (use default!)
-    wandb_entity: str = "opendrivelab"                              # Name of entity to log under
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+    wandb_project: str = "univla-finetune-LIBERO"                          # Name of W&B project to log to (use default!)
+    wandb_entity: str = "junhaochen-tsinghua-university"                              # Name of entity to log under
+    run_id_note: Optional[str] = "0608"                               # Extra note for logging, Weights & Biases
 
 
 
